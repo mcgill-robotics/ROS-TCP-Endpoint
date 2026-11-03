@@ -18,10 +18,12 @@ import socket
 import json
 import sys
 import threading
+import time
 import importlib
 
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.serialization import deserialize_message
 
@@ -43,13 +45,21 @@ class TcpServer(Node):
 
         Args:
             node_name:               ROS node name for executing code
-            buffer_size:             The read buffer size used when reading from a socket
+            buffer_size:             SO_RCVBUF/SO_SNDBUF requested for Unity connections, in bytes.
+                                     Linux caps it at net.core.rmem_max / wmem_max.
             connections:             Max number of queued connections. See Python Socket documentation
         """
         super().__init__(node_name)
 
         self.declare_parameter("ROS_IP", "0.0.0.0")
         self.declare_parameter("ROS_TCP_PORT", 10000)
+        # Seconds without any data from Unity before the connection is considered dead.
+        # Unity sends a keepalive every KeepaliveTime (1 s by default) when idle. 0 disables.
+        # dynamic_typing so that both 10 and 10.0 are accepted from a launch file.
+        self.declare_parameter(
+            "TCP_CLIENT_TIMEOUT", 10.0, ParameterDescriptor(dynamic_typing=True)
+        )
+        self.client_timeout = float(self.get_parameter("TCP_CLIENT_TIMEOUT").value)
 
         if tcp_ip:
             self.loginfo("Using ROS_IP override from constructor: {}".format(tcp_ip))
@@ -76,6 +86,10 @@ class TcpServer(Node):
         self.pending_srv_id = None
         self.pending_srv_is_request = False
 
+        self.shutting_down = False
+        self.client_threads = set()
+        self.client_threads_lock = threading.Lock()
+
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
             self.publishers_table = publishers
@@ -90,23 +104,98 @@ class TcpServer(Node):
         """
             Creates and binds sockets using TCP variables then listens for incoming connections.
             For each new connection a client thread will be created to handle communication.
+
+            This thread must never die: if it does, the endpoint keeps running but Unity can
+            never connect again. So bind is retried, and accept errors are logged and skipped.
         """
         self.loginfo("Starting server on {}:{}".format(self.tcp_ip, self.tcp_port))
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Lets a restarted endpoint bind while old connections are still in TIME_WAIT.
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_server.bind((self.tcp_ip, self.tcp_port))
+        # Set the buffer sizes on the listening socket so accepted sockets inherit them
+        # before the handshake (the TCP window scale is fixed during the handshake).
+        tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.buffer_size)
+        tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.buffer_size)
 
-        while True:
-            tcp_server.listen(self.connections)
+        while not self.shutting_down:
+            try:
+                tcp_server.bind((self.tcp_ip, self.tcp_port))
+                break
+            except OSError as e:
+                # e.g. another endpoint (or a zombie one) still holds the port
+                self.logerr(
+                    "Can't bind {}:{} ({}), retrying in 2 s".format(self.tcp_ip, self.tcp_port, e)
+                )
+                time.sleep(2)
 
+        tcp_server.listen(self.connections)
+        # Wake up regularly so shutdown() doesn't depend on close() interrupting accept().
+        tcp_server.settimeout(1.0)
+
+        while not self.shutting_down:
             try:
                 (conn, (ip, port)) = tcp_server.accept()
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.buffer_size)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.buffer_size)
-                ClientThread(conn, self, ip, port).start()
-            except socket.timeout as err:
-                self.logerr("ros_tcp_endpoint.TcpServer: socket timeout")
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if self.shutting_down:
+                    break
+                self.logerr("ros_tcp_endpoint.TcpServer: accept failed: {}".format(e))
+                time.sleep(0.1)
+                continue
+
+            try:
+                self.configure_client_socket(conn)
+                client = ClientThread(conn, self, ip, port)
+                with self.client_threads_lock:
+                    self.client_threads.add(client)
+                client.start()
+            except Exception as e:
+                # e.g. the client reset the connection right after connecting
+                self.logerr("ros_tcp_endpoint.TcpServer: dropping new connection: {}".format(e))
+                conn.close()
+
+        tcp_server.close()
+
+    def configure_client_socket(self, conn):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # Detect a dead peer (Unity machine gone, cable pulled, VM paused) even if nothing
+        # is being sent. Unity's own keepalives cover the case where the Unity process is
+        # alive but its connection thread is not (see client_timeout below).
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+        elif hasattr(socket, "TCP_KEEPALIVE"):  # macOS
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 5)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+        # Read timeout: if Unity sends nothing (not even its 1 s keepalive) for this long,
+        # recv raises socket.timeout and the ClientThread cleans up. Without it, a socket
+        # leaked by the Unity editor (e.g. exiting play mode) kept a ClientThread alive forever.
+        # Note this also applies to sendall() in the sender thread.
+        if self.client_timeout > 0:
+            conn.settimeout(self.client_timeout)
+        else:
+            conn.settimeout(None)
+
+    def client_finished(self, client):
+        with self.client_threads_lock:
+            self.client_threads.discard(client)
+
+    def shutdown(self):
+        """
+            Stop accepting connections and close every Unity connection, so Unity sees the
+            endpoint go away right now instead of after a timeout.
+        """
+        self.shutting_down = True
+        with self.client_threads_lock:
+            clients = list(self.client_threads)
+        for client in clients:
+            client.close()
 
     def send_unity_error(self, error):
         self.unity_tcp_sender.send_unity_error(error)

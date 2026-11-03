@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import rclpy
+import socket
 import struct
 
 import threading
@@ -46,6 +47,16 @@ class ClientThread(threading.Thread):
         # Set when this connection is finished (read error, send error, or shutdown).
         self.halt_event = threading.Event()
         threading.Thread.__init__(self)
+        # Daemon, so a thread blocked in recv() can't stop the process from exiting on Ctrl+C.
+        self.daemon = True
+
+    def close(self):
+        """Called from another thread (shutdown). Unblocks recv() and sends FIN to Unity."""
+        self.halt_event.set()
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     @staticmethod
     def recvall(conn, size, flags=0):
@@ -221,11 +232,22 @@ class ClientThread(threading.Thread):
                     error_msg = "Error handling message for '{}': {!r}".format(destination, e)
                     self.tcp_server.send_unity_error(error_msg)
                     self.tcp_server.logerr(error_msg)
+        except socket.timeout:
+            self.tcp_server.logwarn(
+                "No data from {} for {} s (Unity sends a keepalive every second), "
+                "assuming it is gone".format(self.incoming_ip, self.tcp_server.client_timeout)
+            )
         except IOError as e:
-            self.tcp_server.logerr("Exception: {}".format(e))
+            if not halt_event.is_set():
+                self.tcp_server.logerr("Exception: {}".format(e))
         finally:
             halt_event.set()
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.conn.close()
+            self.tcp_server.client_finished(self)
             self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))
 
     def process_message(self, destination, data):

@@ -44,7 +44,8 @@ class UnityTcpSender:
         # super().__init__(f'UnityTcpSender')
 
         self.sender_id = 1
-        self.time_between_halt_checks = 5
+        # Also the keepalive interval: when nothing was sent for this long, send one.
+        self.time_between_halt_checks = 1
         self.tcp_server = tcp_server
 
         # Each sender thread has its own queue: this is always the queue for the currently active thread.
@@ -221,14 +222,21 @@ class UnityTcpSender:
                 except Empty:
                     # I'd like to just wait on the queue, but we also need to check occasionally for the connection being closed
                     # (otherwise the thread never terminates.)
-                    continue
+                    if halt_event.is_set():
+                        break
+                    # Nothing to send: send a keepalive (empty destination, empty payload,
+                    # the same 8 zero bytes Unity sends). Unity ignores it, but it lets Unity
+                    # notice a dead endpoint, and makes a dead connection fail here quickly.
+                    item = b"\x00" * 8
 
                 # print("Sender {} sending an item".format(tid))
 
                 try:
                     conn.sendall(item)
                 except Exception as e:
-                    self.tcp_server.logerr("Exception {}".format(e))
+                    # If the reader already closed the socket this is expected, not an error.
+                    if not halt_event.is_set():
+                        self.tcp_server.logerr("Exception {}".format(e))
                     break
         finally:
             halt_event.set()

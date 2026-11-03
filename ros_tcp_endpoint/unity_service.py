@@ -54,7 +54,17 @@ class UnityService(RosReceiver):
         Returns:
             The response message
         """
-        return self.tcp_server.send_unity_service(self.topic, self.service_class, request)
+        unity_response = self.tcp_server.send_unity_service(self.topic, self.service_class, request)
+        if unity_response is None:
+            # Unity is not connected, or disconnected before answering. Returning None here
+            # makes rclpy raise TypeError inside executor.spin(), which kills the whole
+            # endpoint. Answer with the default (empty) response instead.
+            self.get_logger().error(
+                "Unity service {} got no response from Unity (not connected or disconnected); "
+                "returning an empty response".format(self.topic)
+            )
+            return response
+        return unity_response
 
     def unregister(self):
         """

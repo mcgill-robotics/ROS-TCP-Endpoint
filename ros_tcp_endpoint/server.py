@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
 import rclpy
 import socket
 import json
@@ -152,6 +153,10 @@ class TcpServer(Node):
             + len(self.unity_services_table.keys())
             + 1
         )
+        # The tables are normally empty here (Unity registers topics later), so the sum
+        # above is 1. With a single thread, one Unity service callback waiting for Unity
+        # blocked every subscription and every ROS service response in the endpoint.
+        num_threads = max(num_threads, os.cpu_count() or 4, 4)
         executor = MultiThreadedExecutor(num_threads)
 
         executor.add_node(self)

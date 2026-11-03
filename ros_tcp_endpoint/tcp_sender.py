@@ -99,35 +99,63 @@ class UnityTcpSender:
                 self.queue.put(serialized_message)
 
     def send_unity_service_request(self, topic, service_class, request):
-        if self.queue is None:
+        """
+        Forward a ROS service request to Unity and block until Unity answers.
+        Returns None if Unity is not connected, or if the connection that got the
+        request goes away before Unity answers.
+        """
+        # Take one reference: self.queue can be swapped by another thread at any time.
+        target_queue = self.queue
+        if target_queue is None:
             return None
 
         thread_pauser = ThreadPauser()
         with self.srv_lock:
             srv_id = self.next_srv_id
             self.next_srv_id += 1
-            self.services_waiting[srv_id] = thread_pauser
+            # Remember which connection the request went to, so that the waiter can be
+            # released if that connection dies (see abort_unity_service_requests).
+            self.services_waiting[srv_id] = (thread_pauser, target_queue)
 
         command = SysCommand_Service()
         command.srv_id = srv_id
         serialized_header = ClientThread.serialize_command("__request", command)
         serialized_message = ClientThread.serialize_message(topic, request)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        target_queue.put(b"".join([serialized_header, serialized_message]))
 
-        # rospy starts a new thread for each service request,
-        # so it won't break anything if we sleep now while waiting for the response
+        # This runs in an executor thread. It is released either by Unity's response
+        # or by abort_unity_service_requests() when the connection is closed.
         thread_pauser.sleep_until_resumed()
 
-        response = deserialize_message(thread_pauser.result, service_class.Response())
-        return response
+        if thread_pauser.result is None:
+            return None
+        return deserialize_message(thread_pauser.result, service_class.Response())
 
     def send_unity_service_response(self, srv_id, data):
-        thread_pauser = None
         with self.srv_lock:
-            thread_pauser = self.services_waiting[srv_id]
-            del self.services_waiting[srv_id]
+            waiting = self.services_waiting.pop(srv_id, None)
 
+        if waiting is None:
+            # e.g. a response that arrives after its request was aborted. Don't let a
+            # KeyError take down the client thread.
+            self.tcp_server.logwarn(
+                "Ignoring Unity service response with unknown srv_id {}".format(srv_id)
+            )
+            return
+
+        thread_pauser, _ = waiting
         thread_pauser.resume_with_result(data)
+
+    def abort_unity_service_requests(self, dead_queue):
+        """Release every Unity service request that was sent on a connection that is now closed."""
+        with self.srv_lock:
+            dead_ids = [
+                srv_id for srv_id, (_, q) in self.services_waiting.items() if q is dead_queue
+            ]
+            dead = [self.services_waiting.pop(srv_id) for srv_id in dead_ids]
+
+        for thread_pauser, _ in dead:
+            thread_pauser.resume_with_result(None)
 
     def get_registered_topic(self, topic):
         if topic in self.tcp_server.publishers_table:
@@ -207,6 +235,8 @@ class UnityTcpSender:
             with self.queue_lock:
                 if self.queue is local_queue:
                     self.queue = None
+            # Unity will never answer requests sent on this connection.
+            self.abort_unity_service_requests(local_queue)
 
     def parse_message_name(self, name):
         try:

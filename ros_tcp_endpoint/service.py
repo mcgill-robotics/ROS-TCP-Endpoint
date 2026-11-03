@@ -39,8 +39,9 @@ class RosService(RosSender):
         self.service_topic = service
         self.cli = self.create_client(service_class, service)
         self.req = service_class.Request()
+        self.service_class = service_class
 
-    def send(self, data):
+    def send(self, data, should_abort=None):
         """
         Takes in serialized message data from source outside of the ROS network,
         deserializes it into it's class, calls the service with the message, and returns
@@ -48,9 +49,11 @@ class RosService(RosSender):
 
         Args:
             data: The already serialized message_class data coming from outside of ROS
+            should_abort: Optional callable. While waiting for the response it is polled,
+                and the call is abandoned when it returns True (e.g. Unity disconnected).
 
         Returns:
-            service response
+            service response, or None if the call failed or was abandoned
         """
         message_type = type(self.req)
         message = deserialize_message(data, message_type)
@@ -61,14 +64,27 @@ class RosService(RosSender):
             )
             return None
 
-        self.future = self.cli.call_async(message)
+        # Local variable, not self.future: two Unity calls to the same service can be in
+        # flight at once, each on its own thread.
+        future = self.cli.call_async(message)
 
+        # The response is delivered by the executor (another thread), which sets the event.
+        # Wake up regularly so that this thread does not outlive rclpy.shutdown() or the
+        # Unity connection that asked for the call.
         done_event = threading.Event()
-        self.future.add_done_callback(lambda _: done_event.set())
-        done_event.wait()  # blocks without spinning, zero CPU, yields GIL
+        future.add_done_callback(lambda _: done_event.set())
+        while not done_event.wait(0.5):
+            if not rclpy.ok() or (should_abort is not None and should_abort()):
+                self.cli.remove_pending_request(future)
+                self.get_logger().warning(
+                    "Abandoned call to {} (shutdown or Unity disconnected)".format(
+                        self.service_topic
+                    )
+                )
+                return None
 
         try:
-            return self.future.result()
+            return future.result()
         except Exception as e:
             self.get_logger().info(f"Service call failed {e}")
             return None

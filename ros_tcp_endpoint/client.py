@@ -43,6 +43,8 @@ class ClientThread(threading.Thread):
         self.tcp_server = tcp_server
         self.incoming_ip = incoming_ip
         self.incoming_port = incoming_port
+        # Set when this connection is finished (read error, send error, or shutdown).
+        self.halt_event = threading.Event()
         threading.Thread.__init__(self)
 
     @staticmethod
@@ -162,14 +164,28 @@ class ClientThread(threading.Thread):
             service_thread.start()
 
     def service_call_thread(self, srv_id, destination, data, ros_communicator):
-        response = ros_communicator.send(data)
+        response = ros_communicator.send(data, should_abort=self.halt_event.is_set)
+
+        if self.halt_event.is_set():
+            # The Unity session that made this call is gone. Don't send the response to
+            # whichever session is connected now: srv ids restart at 101 in every Unity
+            # session, so it could be matched to an unrelated request.
+            self.tcp_server.logwarn(
+                "Dropping response from '{}': the Unity connection that called it closed".format(
+                    destination
+                )
+            )
+            return
 
         if not response:
-            error_msg = "No response data from service '{}'!".format(destination)
+            error_msg = "No response data from service '{}'! Sending an empty response.".format(
+                destination
+            )
             self.tcp_server.send_unity_error(error_msg)
             self.tcp_server.logerr(error_msg)
-            # TODO: send a response to Unity anyway?
-            return
+            # Unity's SendServiceMessage awaits forever if it gets nothing back, so answer
+            # with the default response rather than leaving the Unity caller stuck.
+            response = ros_communicator.service_class.Response()
 
         self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
 
@@ -189,7 +205,7 @@ class ClientThread(threading.Thread):
 
         """
         self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
-        halt_event = threading.Event()
+        halt_event = self.halt_event
         self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
         try:
             while not halt_event.is_set():

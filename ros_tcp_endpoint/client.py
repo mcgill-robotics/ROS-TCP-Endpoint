@@ -58,7 +58,9 @@ class ClientThread(threading.Thread):
             if not read:
                 raise IOError("No more data available")
             pos += read
-        return buffer
+        # Must be bytes, not bytearray: rclpy's Publisher.publish() only takes raw data
+        # as bytes (TypeError otherwise), and so does rclpy.serialization.deserialize_message().
+        return bytes(buffer)
 
     @staticmethod
     def read_int32(conn):

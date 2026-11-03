@@ -121,9 +121,13 @@ class TcpServer(Node):
         self.unity_tcp_sender.send_unity_service_response(srv_id, data)
 
     def handle_syscommand(self, topic, data):
-        function = getattr(self.syscommands, topic[2:])
+        # getattr without a default raised AttributeError for unknown commands, which
+        # killed the client thread. Names starting with "_" are not commands.
+        name = topic[2:]
+        function = None if name.startswith("_") else getattr(self.syscommands, name, None)
         if function is None:
             self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
+            self.logwarn("Ignoring unknown SysCommand '{}'".format(topic))
         else:
             message_json = data.decode("utf-8")[:-1]
             params = json.loads(message_json)
@@ -175,9 +179,11 @@ class TcpServer(Node):
 
     def unregister_node(self, old_node):
         if old_node is not None:
-            old_node.unregister()
+            # Take the node out of the executor before destroying it, so the executor
+            # never waits on handles that are being destroyed.
             if self.executor is not None:
                 self.executor.remove_node(old_node)
+            old_node.unregister()
 
     def destroy_nodes(self):
         """
@@ -217,6 +223,11 @@ class SysCommands:
 
         old_node = self.tcp_server.subscribers_table.get(topic)
         if old_node is not None:
+            if old_node.msg == message_class:
+                # Unity re-sends every registration when it reconnects. Keep the existing
+                # node instead of destroying and re-creating it every time.
+                self.tcp_server.loginfo("RegisterSubscriber({}) already registered".format(topic))
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_subscriber = RosSubscriber(topic, message_class, self.tcp_server)
@@ -244,6 +255,13 @@ class SysCommands:
 
         old_node = self.tcp_server.publishers_table.get(topic)
         if old_node is not None:
+            if (
+                old_node.message_class == message_class
+                and old_node.queue_size == queue_size
+                and old_node.latch == latch
+            ):
+                self.tcp_server.loginfo("RegisterPublisher({}) already registered".format(topic))
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_publisher = RosPublisher(topic, message_class, queue_size=queue_size, latch=latch)
@@ -273,6 +291,9 @@ class SysCommands:
 
         old_node = self.tcp_server.ros_services_table.get(topic)
         if old_node is not None:
+            if old_node.service_class == message_class:
+                self.tcp_server.loginfo("RegisterRosService({}) already registered".format(topic))
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_service = RosService(topic, message_class)
@@ -303,6 +324,11 @@ class SysCommands:
 
         old_node = self.tcp_server.unity_services_table.get(topic)
         if old_node is not None:
+            if old_node.service_class == message_class:
+                self.tcp_server.loginfo(
+                    "RegisterUnityService({}) already registered".format(topic)
+                )
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_service = UnityService(str(topic), message_class, self.tcp_server)
@@ -312,6 +338,26 @@ class SysCommands:
             self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
+
+    # Unity sends these from Unsubscribe() etc. They had no handler, so the first
+    # Unsubscribe() call raised AttributeError and dropped the connection.
+    def remove_subscriber(self, topic):
+        self._remove(self.tcp_server.subscribers_table, topic, "Subscriber")
+
+    def remove_publisher(self, topic):
+        self._remove(self.tcp_server.publishers_table, topic, "Publisher")
+
+    def remove_ros_service(self, topic):
+        self._remove(self.tcp_server.ros_services_table, topic, "RosService")
+
+    def remove_unity_service(self, topic):
+        self._remove(self.tcp_server.unity_services_table, topic, "UnityService")
+
+    def _remove(self, table, topic, kind):
+        old_node = table.pop(topic, None)
+        if old_node is not None:
+            self.tcp_server.unregister_node(old_node)
+            self.tcp_server.loginfo("Remove{}({}) OK".format(kind, topic))
 
     def response(self, srv_id):  # the next message is a service response
         self.tcp_server.pending_srv_id = srv_id

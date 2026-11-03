@@ -207,35 +207,18 @@ class ClientThread(threading.Thread):
         self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
         halt_event = self.halt_event
         self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
+        # A "__request"/"__response" header left over from a connection that died between
+        # the header and its payload would otherwise swallow this session's first message.
+        self.tcp_server.pending_srv_id = None
         try:
             while not halt_event.is_set():
                 destination, data = self.read_message(self.conn)
-
-                # Process this message that was sent from Unity
-                if self.tcp_server.pending_srv_id is not None:
-                    # if we've been told that the next message will be a service request/response, process it as such
-                    if self.tcp_server.pending_srv_is_request:
-                        self.send_ros_service_request(
-                            self.tcp_server.pending_srv_id, destination, data
-                        )
-                    else:
-                        self.tcp_server.send_unity_service_response(
-                            self.tcp_server.pending_srv_id, data
-                        )
-                    self.tcp_server.pending_srv_id = None
-                elif destination == "":
-                    # ignore this keepalive message, listen for more
-                    pass
-                elif destination.startswith("__"):
-                    # handle a system command, such as registering new topics
-                    self.tcp_server.handle_syscommand(destination, data)
-                elif destination in self.tcp_server.publishers_table:
-                    ros_communicator = self.tcp_server.publishers_table[destination]
-                    ros_communicator.send(data)
-                else:
-                    error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
-                        destination, self.tcp_server.publishers_table.keys()
-                    )
+                try:
+                    self.process_message(destination, data)
+                except Exception as e:
+                    # A bad message (unknown type, malformed data, bad sys command params)
+                    # is reported but must not end the connection.
+                    error_msg = "Error handling message for '{}': {!r}".format(destination, e)
                     self.tcp_server.send_unity_error(error_msg)
                     self.tcp_server.logerr(error_msg)
         except IOError as e:
@@ -244,3 +227,31 @@ class ClientThread(threading.Thread):
             halt_event.set()
             self.conn.close()
             self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))
+
+    def process_message(self, destination, data):
+        """Route one message from Unity."""
+        # Process this message that was sent from Unity
+        if self.tcp_server.pending_srv_id is not None:
+            # if we've been told that the next message will be a service request/response, process it as such
+            # (clear pending_srv_id first, so an exception below can't leave it set)
+            srv_id = self.tcp_server.pending_srv_id
+            self.tcp_server.pending_srv_id = None
+            if self.tcp_server.pending_srv_is_request:
+                self.send_ros_service_request(srv_id, destination, data)
+            else:
+                self.tcp_server.send_unity_service_response(srv_id, data)
+        elif destination == "":
+            # ignore this keepalive message, listen for more
+            pass
+        elif destination.startswith("__"):
+            # handle a system command, such as registering new topics
+            self.tcp_server.handle_syscommand(destination, data)
+        elif destination in self.tcp_server.publishers_table:
+            ros_communicator = self.tcp_server.publishers_table[destination]
+            ros_communicator.send(data)
+        else:
+            error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
+                destination, self.tcp_server.publishers_table.keys()
+            )
+            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.logerr(error_msg)

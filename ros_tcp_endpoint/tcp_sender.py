@@ -211,6 +211,10 @@ class UnityTcpSender:
         handshake_metadata = SysCommand_Handshake_Metadata()
         handshake = SysCommand_Handshake(handshake_metadata)
         local_queue.put(ClientThread.serialize_command("__handshake", handshake))
+        # One keepalive straight away, even if the queue never goes idle. The fork's Unity
+        # connector only treats our silence as a dead connection once it has seen a keepalive
+        # from us (upstream endpoints never send one).
+        local_queue.put(b"\x00" * 8)
 
         with self.queue_lock:
             self.queue = local_queue

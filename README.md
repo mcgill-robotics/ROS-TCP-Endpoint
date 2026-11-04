@@ -1,8 +1,8 @@
 # ROS TCP Endpoint (McGill Robotics fork)
 
-This is a fork of Unity's [ROS-TCP-Endpoint](https://github.com/Unity-Technologies/ROS-TCP-Endpoint), ROS 2 branch, release 0.7.0. It runs on the ROS 2 side of the McGill Robotics AUV stack (Humble, also checked on Jazzy) and talks to our Unity 6 simulator through the matching connector fork, [kaidalisohaib/ROS-TCP-Connector](https://github.com/kaidalisohaib/ROS-TCP-Connector) (branch `main-ros2-optimized`).
+Fork of the ROS 2 branch of Unity's [ROS-TCP-Endpoint](https://github.com/Unity-Technologies/ROS-TCP-Endpoint) (0.7.0). It's the ROS side of the bridge between the McGill Robotics AUV stack (ROS 2 Jazzy, also tested on Humble) and our Unity simulator, which uses our [connector fork](https://github.com/kaidalisohaib/ROS-TCP-Connector).
 
-Upstream is no longer maintained. We forked it to cut some per-message overhead, and because the bridge often got stuck when the sim or ROS was not closed properly, or when the two were started and stopped in a different order. The wire protocol is unchanged, so this endpoint still works with the upstream connector and the other way round.
+Most of the changes are about the bridge getting stuck when one side was killed, restarted, or closed out of order. A few are per-message optimizations from summer 2026. The protocol didn't change, so it still works with the upstream connector.
 
 ## What is different from upstream
 
@@ -17,12 +17,12 @@ The summer commit also changed `recvall` to return a `bytearray`. That broke eve
 
 Connection fixes (`connection-robustness` branch):
 
-- Dead Unity clients are detected. Each Unity socket has a read timeout (`TCP_CLIENT_TIMEOUT`, default 10 s) and TCP keepalive. Unity sends a keepalive every second when idle, so silence means the Unity side is gone. A socket the editor never closed used to keep its thread alive forever.
+- Dead Unity clients get dropped. Each Unity socket has a read timeout (`TCP_CLIENT_TIMEOUT`, default 10 s) and TCP keepalive. Unity sends a keepalive every second when idle, so silence means the Unity side is gone. Without this, a socket the editor never closed kept its thread forever.
 - The endpoint sends keepalives to Unity: one after the handshake, then one after every second of silence. Upstream and fork connectors both ignore them. The fork connector uses them to notice a dead endpoint.
-- The listen thread can't die anymore. Bind is retried, and accept or socket setup errors are logged and skipped.
+- Bind is retried, and accept or socket setup errors are logged and skipped instead of killing the listen thread.
 - Ctrl+C works with Unity connected. Client threads are daemons, all sockets are closed (Unity sees the disconnect right away and starts reconnecting), nodes are destroyed and rclpy is shut down.
-- Reconnecting doesn't churn nodes. If Unity re-registers a topic with the same type and settings, the existing node is kept.
-- Unity service calls can't hang or crash the endpoint. They used to do one or the other when Unity was not connected, disconnected mid-call, or answered very fast. The executor also has at least 4 threads now instead of 1, so one waiting Unity service doesn't block every subscription.
+- When Unity reconnects and re-registers a topic with the same type and settings, the existing node is reused instead of being destroyed and created again.
+- Unity services no longer hang or crash the endpoint when Unity isn't connected, disconnects mid-call, or answers very fast. The executor also has at least 4 threads now instead of 1, so one waiting Unity service doesn't block every subscription.
 - ROS service calls from Unity give up on shutdown or when that Unity connection closes. Unity always gets an answer, an empty response if the call failed. Responses for a closed connection are dropped instead of being sent to the next Unity session.
 - Unknown sys commands, `__remove_*` commands (sent by `Unsubscribe()`, never implemented upstream) and bad messages no longer close the connection.
 
@@ -31,7 +31,7 @@ Connection fixes (`connection-robustness` branch):
 Clone the branch into your workspace and build:
 
 ```bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 cd ~/ros2_ws/src
 git clone -b main-ros2-optimized https://github.com/kaidalisohaib/ROS-TCP-Endpoint.git ros-tcp-endpoint
 cd ~/ros2_ws
@@ -39,8 +39,6 @@ colcon build --packages-select ros_tcp_endpoint
 source install/setup.bash
 ros2 launch ros_tcp_endpoint endpoint.py
 ```
-
-Use `-b connection-robustness` until that branch is merged into `main-ros2-optimized`.
 
 Or as a git submodule, pinned to a commit:
 
@@ -61,10 +59,10 @@ ros2 run ros_tcp_endpoint default_server_endpoint --ros-args -p ROS_TCP_PORT:=10
 
 ## Testing
 
-`test/integration/scenarios.py` starts the endpoint, plays Unity with a small fake client (`fake_unity.py`), and checks publish, subscribe, both service directions, reconnects, half-open and silent clients, Ctrl+C and restart. Without ROS installed locally, run it in docker:
+`test/integration/scenarios.py` starts the endpoint, acts as Unity using a small fake client (`fake_unity.py`), and checks publish, subscribe, both service directions, reconnects, half-open and silent clients, Ctrl+C and restart. Without ROS installed locally, run it in docker:
 
 ```bash
-test/integration/run_in_docker.sh                                      # ros:humble-ros-base
+test/integration/run_in_docker.sh                                      # ros:humble-ros-base (default)
 test/integration/run_in_docker.sh mcgillrobotics/auv_2026:latest-amd64  # our image (Jazzy)
 ```
 

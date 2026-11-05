@@ -15,21 +15,21 @@
 import rclpy
 import socket
 import re
+import threading
 
-from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy, QoSProfile
+from rclpy.event_handler import SubscriptionEventCallbacks
 
 from .communication import RosReceiver
 
 
 class RosSubscriber(RosReceiver):
     """
-    Class to send messages outside of ROS network
+    Class to send messages outside of ROS network with automatic QoS adaptation.
     """
 
     def __init__(self, topic, message_class, tcp_server, queue_size=10):
         """
-
         Args:
             topic:         Topic name to publish messages to
             message_class: The message class in catkin workspace
@@ -42,14 +42,57 @@ class RosSubscriber(RosReceiver):
         self.msg = message_class
         self.tcp_server = tcp_server
         self.queue_size = queue_size
+        self._lock = threading.Lock()
+        self._is_best_effort = False
 
-        qos_profile = QoSProfile(depth=queue_size)
+        # Pre-check: If an active publisher on the topic is already BEST_EFFORT, start as BEST_EFFORT
+        reliability = QoSReliabilityPolicy.RELIABLE
+        try:
+            publishers_info = self.get_publishers_info_by_topic(self.topic)
+            if any(p.qos_profile.reliability == QoSReliabilityPolicy.BEST_EFFORT for p in publishers_info):
+                reliability = QoSReliabilityPolicy.BEST_EFFORT
+                self._is_best_effort = True
+                self.get_logger().info(
+                    f"Discovered BEST_EFFORT publisher on {self.topic}; subscribing with BEST_EFFORT QoS."
+                )
+        except Exception as e:
+            self.get_logger().debug(f"Could not query publisher info for {self.topic}: {e}")
 
-        # Start Subscriber listener function
-        self.subscription = self.create_subscription(
-            self.msg, self.topic, self.send, qos_profile, raw=True
+        self.subscription = self._create_subscription_with_reliability(reliability)
+
+    def _on_incompatible_qos(self, event):
+        """
+        DDS callback triggered when an incompatible publisher is discovered.
+        Dynamically upgrades the subscription to BEST_EFFORT if a publisher offered BEST_EFFORT.
+        """
+        with self._lock:
+            if not self._is_best_effort:
+                self.get_logger().warn(
+                    f"Incompatible QoS detected on topic '{self.topic}' (publisher offered BEST_EFFORT). "
+                    f"Dynamically switching subscription to BEST_EFFORT."
+                )
+                self._is_best_effort = True
+                try:
+                    if self.subscription is not None:
+                        self.destroy_subscription(self.subscription)
+                    self.subscription = self._create_subscription_with_reliability(QoSReliabilityPolicy.BEST_EFFORT)
+                except Exception as e:
+                    self.get_logger().error(f"Failed to recreate subscription for {self.topic} as BEST_EFFORT: {e}")
+
+    def _create_subscription_with_reliability(self, reliability):
+        qos_profile = QoSProfile(
+            depth=self.queue_size,
+            reliability=reliability
         )
-        self.subscription
+        callbacks = SubscriptionEventCallbacks(incompatible_qos=self._on_incompatible_qos)
+        return self.create_subscription(
+            self.msg,
+            self.topic,
+            self.send,
+            qos_profile,
+            event_callbacks=callbacks,
+            raw=True
+        )
 
     def send(self, data):
         """
@@ -59,16 +102,16 @@ class RosSubscriber(RosReceiver):
 
         Returns:
             self.msg: The deserialize message
-
         """
         self.tcp_server.send_unity_message(self.topic, data)
         return self.msg
 
     def unregister(self):
         """
-
-        Returns:
-
+        Clean up subscription and destroy node.
         """
-        self.destroy_subscription(self.subscription)
-        self.destroy_node()
+        with self._lock:
+            if self.subscription is not None:
+                self.destroy_subscription(self.subscription)
+                self.subscription = None
+            self.destroy_node()

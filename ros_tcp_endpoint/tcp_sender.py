@@ -264,18 +264,18 @@ class UnityTcpSender:
 
 class SysCommand_Log:
     def __init__(self):
-        text = ""
+        self.text = ""
 
 
 class SysCommand_Service:
     def __init__(self):
-        srv_id = 0
+        self.srv_id = 0
 
 
 class SysCommand_TopicsResponse:
     def __init__(self):
-        topics = []
-        types = []
+        self.topics = []
+        self.types = []
 
 
 class SysCommand_Handshake:
